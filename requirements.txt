@@ -1,0 +1,2 @@
+# Sentry runs on the Python standard library only — no third-party runtime deps.
+# PySide6 (the in-app panel) is provided by the parent Sentinel app environment.
