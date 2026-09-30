@@ -158,29 +158,52 @@ def _split_lsof_name(name: str) -> tuple[str, int] | None:
         return None
 
 
+def _lsof_fields(line: str) -> tuple[str, int | None, str, str] | None:
+    """Extract (command, pid, protocol, name) from one lsof row.
+
+    lsof's COMMAND column can contain spaces (a name truncated to nine chars,
+    e.g. ``Google Ch``), which shifts fixed column indices after a naive
+    ``split()`` and made the protocol check fail so the row was silently
+    dropped. The NODE (protocol) column is always ``TCP``/``UDP``, is followed
+    by NAME, and is preceded by six columns (PID USER FD TYPE DEVICE SIZE/OFF),
+    so find it from the right and index around it instead. Searching from the
+    right means a COMMAND that itself contains ``tcp``/``udp`` cannot win.
+    """
+    cols = line.split()
+    if not cols or cols[0] == "COMMAND":
+        return None
+    node = None
+    for i in range(len(cols) - 1, -1, -1):
+        if cols[i].lower() in ("tcp", "udp") and i + 1 < len(cols):
+            node = i
+            break
+    if node is None or node < 7:
+        return None
+    pid_idx = node - 6
+    try:
+        pid = int(cols[pid_idx])
+    except (ValueError, IndexError):
+        pid = None
+    command = " ".join(cols[:pid_idx]) if pid_idx > 0 else ""
+    return command, pid, cols[node].lower(), cols[node + 1]
+
+
 def parse_lsof_listeners(text: str) -> list[Listener]:
     """Parse ``lsof -nP -iTCP -sTCP:LISTEN`` (and the UDP variant) output."""
     listeners: list[Listener] = []
     seen: set[str] = set()
     for line in text.splitlines():
-        cols = line.split()
-        if len(cols) < 9 or cols[0] == "COMMAND":
+        fields = _lsof_fields(line)
+        if not fields:
             continue
-        protocol = cols[7].lower()
-        if protocol not in ("tcp", "udp"):
-            continue
-        name = cols[8]
+        command, pid, protocol, name = fields
         parsed = _split_lsof_name(name)
         if not parsed:
             continue
         addr, port = parsed
-        try:
-            pid = int(cols[1])
-        except ValueError:
-            pid = None
         listener = Listener(
             protocol=protocol, address=addr.strip("[]"), port=port,
-            process=cols[0], pid=pid,
+            process=command, pid=pid,
         )
         if listener.key() in seen:
             continue
@@ -194,13 +217,10 @@ def parse_lsof_connections(text: str) -> list[Connection]:
     connections: list[Connection] = []
     seen: set[str] = set()
     for line in text.splitlines():
-        cols = line.split()
-        if len(cols) < 9 or cols[0] == "COMMAND":
+        fields = _lsof_fields(line)
+        if not fields:
             continue
-        protocol = cols[7].lower()
-        if protocol not in ("tcp", "udp"):
-            continue
-        name = cols[8]
+        command, pid, protocol, name = fields
         conn_match = _CONN_RE.match(name.strip())
         if not conn_match:
             continue
@@ -208,13 +228,9 @@ def parse_lsof_connections(text: str) -> list[Connection]:
         if not remote:
             continue
         raddr, rport = remote
-        try:
-            pid = int(cols[1])
-        except ValueError:
-            pid = None
         conn = Connection(
             protocol=protocol, remote_address=raddr.strip("[]"), remote_port=rport,
-            process=cols[0], pid=pid,
+            process=command, pid=pid,
         )
         if conn.key() in seen:
             continue

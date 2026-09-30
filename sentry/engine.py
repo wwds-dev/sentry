@@ -56,15 +56,24 @@ def _device_findings(baseline: Snapshot, current: Snapshot) -> list[Finding]:
                 evidence={"ip": device.ip, "mac": device.mac, "interface": device.interface},
             ))
 
-    # ARP anomalies within the current snapshot: one IP claimed by several MACs
-    # (or one MAC answering for several IPs) is the classic spoof / MITM tell.
+    # ARP anomaly: one IP claimed by several MACs is the classic spoof / MITM
+    # tell. (One MAC holding several IPs is ordinary — dual-stack hosts, routers,
+    # VLANs — so it is deliberately not treated as a signal.)
     ip_to_macs: dict[str, set[str]] = defaultdict(set)
-    mac_to_ips: dict[str, set[str]] = defaultdict(set)
     for device in current.devices:
         ip_to_macs[device.ip].add(device.mac)
-        mac_to_ips[device.mac].add(device.ip)
+    baseline_ip_to_macs: dict[str, set[str]] = defaultdict(set)
+    for device in baseline.devices:
+        baseline_ip_to_macs[device.ip].add(device.mac)
     for ip, macs in ip_to_macs.items():
         if len(macs) > 1:
+            # Report only when a MAC newly claims this IP. merge_into_baseline
+            # unions devices, so once a conflict is folded in, an unchanged
+            # duplicate mapping is not re-reported on every pass (which would
+            # otherwise flood the log and evict real history); a genuinely new
+            # conflicting MAC still is.
+            if macs <= baseline_ip_to_macs.get(ip, set()):
+                continue
             severity = "alert" if ip == current.gateway_ip else "warning"
             findings.append(Finding(
                 severity=severity,
@@ -177,6 +186,13 @@ def diff(baseline: Snapshot, current: Snapshot) -> list[Finding]:
     return findings
 
 
+# Outbound endpoints accumulate forever across passes, so the connections
+# baseline is capped: without a bound it grows unbounded and is fully
+# re-serialised every pass. The cap is generous enough that eviction (which can
+# re-report a long-idle endpoint once) is rare in practice.
+MAX_BASELINE_CONNECTIONS = 4096
+
+
 def merge_into_baseline(baseline: Snapshot, current: Snapshot) -> Snapshot:
     """Fold a snapshot into the baseline so seen items are not re-reported.
 
@@ -184,18 +200,26 @@ def merge_into_baseline(baseline: Snapshot, current: Snapshot) -> Snapshot:
     settles after being reported once); devices, listeners and connections are
     the union of both, keyed by identity.
     """
-    def _union(existing, incoming):
+    def _union(existing, incoming, cap=None):
         merged = {item.key(): item for item in existing}
         for item in incoming:
-            merged.setdefault(item.key(), item)
-        return list(merged.values())
+            # Move a re-seen item to the end (delete then re-insert) so the tail
+            # always holds the most recently observed endpoints. With plain
+            # setdefault an item still present in the current snapshot would keep
+            # its old position and could be evicted by the cap, then re-reported
+            # as new when it reappeared.
+            merged.pop(item.key(), None)
+            merged[item.key()] = item
+        values = list(merged.values())
+        return values[-cap:] if cap is not None else values
 
     return Snapshot(
         gateway_ip=current.gateway_ip or baseline.gateway_ip,
         gateway_mac=current.gateway_mac or baseline.gateway_mac,
         devices=_union(baseline.devices, current.devices),
         listeners=_union(baseline.listeners, current.listeners),
-        connections=_union(baseline.connections, current.connections),
+        connections=_union(baseline.connections, current.connections,
+                           cap=MAX_BASELINE_CONNECTIONS),
         taken_at=current.taken_at,
     )
 
@@ -210,21 +234,25 @@ def run_watch(store: BaselineStore | None = None, *, snapshot: Snapshot | None =
     store = store or BaselineStore()
     current = snapshot if snapshot is not None else collect_snapshot()
 
-    baseline = store.load_baseline()
-    if baseline is None:
-        store.save_baseline(current)
-        return {
-            "baseline_established": True,
-            "findings": [],
-            "device_count": len(current.devices),
-            "listener_count": len(current.listeners),
-            "connection_count": len(current.connections),
-            "taken_at": current.taken_at,
-        }
+    # Hold the store lock across the whole load→diff→merge→save so a concurrent
+    # pass (in-app worker vs. launchd watcher) cannot load the same baseline and
+    # overwrite the other's merged state, which would re-report folded findings.
+    with store.transaction():
+        baseline = store.load_baseline()
+        if baseline is None:
+            store.save_baseline(current)
+            return {
+                "baseline_established": True,
+                "findings": [],
+                "device_count": len(current.devices),
+                "listener_count": len(current.listeners),
+                "connection_count": len(current.connections),
+                "taken_at": current.taken_at,
+            }
 
-    findings = diff(baseline, current)
-    store.append_findings(findings)
-    store.save_baseline(merge_into_baseline(baseline, current))
+        findings = diff(baseline, current)
+        store.append_findings(findings)
+        store.save_baseline(merge_into_baseline(baseline, current))
 
     top = findings[0].severity if findings else "info"
     return {
