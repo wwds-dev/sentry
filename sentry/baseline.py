@@ -92,6 +92,20 @@ class BaselineStore:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.baseline_path = self.state_dir / "baseline.json"
         self.findings_path = self.state_dir / "findings.json"
+        self.watch_lock_path = self.state_dir / "watch.lock"
+
+    @contextmanager
+    def transaction(self):
+        """Serialise a whole watch pass across processes.
+
+        The per-file locks on save_baseline/append_findings stop a single write
+        from being torn, but not the load→diff→merge→save read-modify-write of a
+        full pass: two watchers (the in-app worker and the launchd watcher) could
+        each load the same baseline and the later save would drop the other's
+        merged devices/listeners/connections, re-reporting them later. Holding
+        this lock across the whole pass (see run_watch) prevents that."""
+        with _file_lock(self.watch_lock_path):
+            yield
 
     # ── baseline ──────────────────────────────────────────────────────────
     def load_baseline(self) -> Snapshot | None:

@@ -203,10 +203,14 @@ def merge_into_baseline(baseline: Snapshot, current: Snapshot) -> Snapshot:
     def _union(existing, incoming, cap=None):
         merged = {item.key(): item for item in existing}
         for item in incoming:
-            merged.setdefault(item.key(), item)
+            # Move a re-seen item to the end (delete then re-insert) so the tail
+            # always holds the most recently observed endpoints. With plain
+            # setdefault an item still present in the current snapshot would keep
+            # its old position and could be evicted by the cap, then re-reported
+            # as new when it reappeared.
+            merged.pop(item.key(), None)
+            merged[item.key()] = item
         values = list(merged.values())
-        # Keep the most recent when capped: incoming items were setdefault-ed
-        # after the existing ones, so the tail holds the newest endpoints.
         return values[-cap:] if cap is not None else values
 
     return Snapshot(
@@ -230,21 +234,25 @@ def run_watch(store: BaselineStore | None = None, *, snapshot: Snapshot | None =
     store = store or BaselineStore()
     current = snapshot if snapshot is not None else collect_snapshot()
 
-    baseline = store.load_baseline()
-    if baseline is None:
-        store.save_baseline(current)
-        return {
-            "baseline_established": True,
-            "findings": [],
-            "device_count": len(current.devices),
-            "listener_count": len(current.listeners),
-            "connection_count": len(current.connections),
-            "taken_at": current.taken_at,
-        }
+    # Hold the store lock across the whole load→diff→merge→save so a concurrent
+    # pass (in-app worker vs. launchd watcher) cannot load the same baseline and
+    # overwrite the other's merged state, which would re-report folded findings.
+    with store.transaction():
+        baseline = store.load_baseline()
+        if baseline is None:
+            store.save_baseline(current)
+            return {
+                "baseline_established": True,
+                "findings": [],
+                "device_count": len(current.devices),
+                "listener_count": len(current.listeners),
+                "connection_count": len(current.connections),
+                "taken_at": current.taken_at,
+            }
 
-    findings = diff(baseline, current)
-    store.append_findings(findings)
-    store.save_baseline(merge_into_baseline(baseline, current))
+        findings = diff(baseline, current)
+        store.append_findings(findings)
+        store.save_baseline(merge_into_baseline(baseline, current))
 
     top = findings[0].severity if findings else "info"
     return {
