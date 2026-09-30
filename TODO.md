@@ -15,6 +15,7 @@
 - [x] `P1` `feature` `@ai` In-app panel with findings render, optional AI read behind the shared request guard, baseline reset, and background-watch controls.
 - [x] `P1` `testing` `@ai` Engine tests (parsers, classification, diff scenarios, persistence) and panel tests (`tests/test_ui_panels.py::TestSentryPanel`).
 - [x] `P1` `docs` `@ai` `docs/agents/sentry.md`, README roster 7 → 8.
+- [x] `P1` `bug` `security` `@ai` Code-review fixes (2026-09-29): arp-spoof findings now dedupe against the baseline (a steady benign duplicate mapping no longer re-emits an identical finding every pass and evict real history through the 500-record cap); lsof parsing locates the protocol column from the right so a process name with a space (e.g. the truncated "Google Ch") no longer shifts the columns and drops the row; baseline/findings are written atomically under a cross-process flock (a truncated write no longer makes `load_baseline` return None and `run_watch` silently suppress every finding); the connections baseline is capped; the unused one-MAC-many-IPs path (ordinary for dual-stack/routers, not a spoof signal) was removed.
 
 ## v2 — planned
 
