@@ -237,3 +237,54 @@ def test_second_run_reports_then_folds_into_baseline(tmp_path):
     # A third identical pass must not re-report the now-known device.
     third = engine.run_watch(store, snapshot=second)
     assert third["findings"] == []
+
+
+# ── regression: fixes from the ultra code review ─────────────────────────────
+
+def test_lsof_parses_command_names_with_spaces():
+    # macOS truncates COMMAND to nine chars but keeps embedded spaces, so
+    # "Google Chrome" prints as "Google Ch". A naive split() shifted the columns
+    # and the row was dropped; the protocol/name must still be read correctly.
+    sample = (
+        "COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\n"
+        "Google Ch  4242   as   40u  IPv4 0xabc      0t0  TCP *:7000 (LISTEN)\n"
+    )
+    listeners = collectors.parse_lsof_listeners(sample)
+    assert len(listeners) == 1
+    assert listeners[0].process == "Google Ch"
+    assert listeners[0].port == 7000 and listeners[0].pid == 4242
+
+    conn_sample = (
+        "COMMAND     PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\n"
+        "Google Ch  4242   as   50u  IPv4 0xdef      0t0  "
+        "TCP 192.168.1.5:51000->140.82.112.3:443 (ESTABLISHED)\n"
+    )
+    conns = collectors.parse_lsof_connections(conn_sample)
+    assert len(conns) == 1
+    assert conns[0].process == "Google Ch"
+    assert conns[0].remote_address == "140.82.112.3" and conns[0].remote_port == 443
+
+
+def test_persistent_arp_conflict_is_reported_once_then_settles(tmp_path):
+    # A steady duplicate ARP mapping (benign dual-homed host, etc.) must not
+    # re-emit an identical arp_spoof finding on every pass and evict real history.
+    store = BaselineStore(tmp_path)
+    first = Snapshot(
+        gateway_ip="192.168.10.1", gateway_mac="94:83:c4:a8:81:19",
+        devices=[Device(ip="192.168.10.1", mac="94:83:c4:a8:81:19", interface="en0")],
+    )
+    engine.run_watch(store, snapshot=first)
+
+    conflict = Snapshot(
+        gateway_ip="192.168.10.1", gateway_mac="94:83:c4:a8:81:19",
+        devices=[
+            Device(ip="192.168.10.50", mac="aa:aa:aa:aa:aa:aa", interface="en0"),
+            Device(ip="192.168.10.50", mac="bb:bb:bb:bb:bb:bb", interface="en0"),
+        ],
+    )
+    reported = engine.run_watch(store, snapshot=conflict)
+    assert any(f["kind"] == "arp_spoof" for f in reported["findings"])
+
+    # Same conflict again -> already folded into the baseline -> not re-reported.
+    again = engine.run_watch(store, snapshot=conflict)
+    assert not any(f["kind"] == "arp_spoof" for f in again["findings"])
