@@ -39,11 +39,31 @@ sentry/            engine package (pure, testable)
 main.py            standalone + headless (--headless) entry
 tests/             engine tests (parsers, classification, diff, persistence)
 launchd/           launch-agent plist template
+data/              gitignored standalone-mode fallback state (see Data below)
 ```
 
 In the app, the panel is `ui/panels/sentry.py` and the chat agent is
 `sentinel_chat_agent.py → SentryAgent`. Developer reference:
 `../../docs/agents/sentry.md`.
+
+## Data
+
+Sentry's state is three small files in one writable directory:
+
+- `baseline.json` — the trusted snapshot (`Snapshot.devices` / `listeners` /
+  `connections`) that `diff()` compares every later pass against
+- `findings.json` — the rolling findings log (last 500), read by `report`, the
+  in-app panel, and the background watcher
+- `watch.log` — stdout/stderr from each launchd background pass
+
+Inside the app, that directory is Sentinel's own writable base
+(`user_data_base() / "data" / "sentry"`), so it follows Sentinel's normal
+data-location rules (Lab checkout in development, Application Support for a
+self-contained build). Run standalone/headless with the app package
+unavailable, it falls back to this repo's own `data/` directory — gitignored,
+created on first use, empty in a fresh checkout — mirroring how Bug Spray
+stores its feed. `BaselineStore(state_dir=...)` can override the location,
+mainly for tests. See `sentry/baseline.py`.
 
 ## CLI
 
