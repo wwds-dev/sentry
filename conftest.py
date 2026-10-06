@@ -2,7 +2,7 @@
 
 Only loaded when pytest collects files under agents/sentry/, so the parent
 Sentinel suite (testpaths = tests) never sees it. Mirrors how each agent under
-sentinel_fork/agents/ is its own repo.
+sentinel/agents/ is its own repo.
 """
 import sys
 from pathlib import Path
